@@ -1,0 +1,386 @@
+name: BB Render Farm — Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'          # triggers on: git tag v1.0.0 && git push --tags
+  workflow_dispatch:      # manual trigger from GitHub UI
+
+env:
+  APP_NAME: BBRenderFarm
+  QT_VERSION: 6.7.0
+
+jobs:
+# ═══════════════════════════════════════════════════════════════
+#  WINDOWS  (MSVC 2022 + Qt6 + NSIS installer)
+# ═══════════════════════════════════════════════════════════════
+  build-windows:
+    name: 🪟 Windows (MSVC x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version:    ${{ env.QT_VERSION }}
+          host:       windows
+          target:     desktop
+          arch:       win64_msvc2019_64
+          modules:    qtcharts
+          cache:      true
+
+      - name: Install NSIS (installer builder)
+        run: choco install nsis -y
+
+      - name: Configure (CMake)
+        run: |
+          cmake -B build_win -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBBRENDER_BUILD_FRONTEND=ON `
+            -DBBRENDER_BUILD_BACKEND=ON `
+            -DBBRENDER_USE_OPENSSL=OFF
+
+      - name: Build
+        run: cmake --build build_win --config Release --parallel
+
+      - name: Deploy Qt DLLs (windeployqt)
+        shell: pwsh
+        run: |
+          $qt = "$env:Qt6_DIR/../../../bin"
+          & "$qt/windeployqt.exe" `
+            --release --no-translations `
+            --no-system-d3d-compiler `
+            build_win/bin/Release/BBRenderFarm.exe
+          & "$qt/windeployqt.exe" --release `
+            build_win/bin/Release/BBRenderServer.exe
+          & "$qt/windeployqt.exe" --release `
+            build_win/bin/Release/BBRenderWorker.exe
+
+      - name: Write NSIS installer script
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          $nsis = @"
+          !define APP_NAME    "BB Render Farm"
+          !define APP_VERSION "$ver"
+          !define APP_EXE     "BBRenderFarm.exe"
+          !define OUT_FILE    "BBRenderFarm-$ver-windows-x64-setup.exe"
+
+          OutFile "\$\${OUT_FILE}"
+          InstallDir "\$PROGRAMFILES64\BBRenderFarm"
+          RequestExecutionLevel admin
+          Name "\$\${APP_NAME} \$\${APP_VERSION}"
+
+          Page directory
+          Page instfiles
+          UninstPage uninstConfirm
+          UninstPage instfiles
+
+          Section "Main"
+            SetOutPath "\$INSTDIR"
+            File /r "build_win\bin\Release\*.*"
+            WriteUninstaller "\$INSTDIR\uninstall.exe"
+            CreateDirectory "\$SMPROGRAMS\BBRenderFarm"
+            CreateShortCut  "\$SMPROGRAMS\BBRenderFarm\BB Render Farm.lnk" "\$INSTDIR\BBRenderFarm.exe"
+            CreateShortCut  "\$DESKTOP\BB Render Farm.lnk" "\$INSTDIR\BBRenderFarm.exe"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\BBRenderFarm" \
+              "DisplayName" "\$\${APP_NAME}"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\BBRenderFarm" \
+              "UninstallString" "\$INSTDIR\uninstall.exe"
+          SectionEnd
+
+          Section "Uninstall"
+            Delete "\$INSTDIR\uninstall.exe"
+            RMDir  /r "\$INSTDIR"
+            Delete "\$SMPROGRAMS\BBRenderFarm\*.lnk"
+            RMDir  "\$SMPROGRAMS\BBRenderFarm"
+            Delete "\$DESKTOP\BB Render Farm.lnk"
+          SectionEnd
+          "@
+          $nsis | Out-File -Encoding ascii installer.nsi
+
+      - name: Build NSIS installer
+        run: makensis installer.nsi
+
+      - name: Create ZIP portable
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          Compress-Archive -Path "build_win\bin\Release\*" `
+            -DestinationPath "BBRenderFarm-$ver-windows-x64-portable.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            BBRenderFarm-*-windows-x64-setup.exe
+            BBRenderFarm-*-windows-x64-portable.zip
+
+# ═══════════════════════════════════════════════════════════════
+#  LINUX  (GCC + Qt6 + AppImage)
+# ═══════════════════════════════════════════════════════════════
+  build-linux:
+    name: 🐧 Linux (GCC x86_64 AppImage)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build \
+            gcc g++ \
+            libgl1-mesa-dev \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+            libxkbcommon-x11-0 libfontconfig1 \
+            libssl-dev \
+            patchelf fuse
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version:  ${{ env.QT_VERSION }}
+          host:     linux
+          target:   desktop
+          arch:     gcc_64
+          modules:  qtcharts
+          cache:    true
+
+      - name: Configure
+        run: |
+          cmake -B build_linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBBRENDER_BUILD_FRONTEND=ON \
+            -DBBRENDER_BUILD_BACKEND=ON
+
+      - name: Build
+        run: cmake --build build_linux --parallel $(nproc)
+
+      - name: Download linuxdeploy + Qt plugin
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
+
+      - name: Build AppImage — BBRenderFarm (GUI)
+        env:
+          OUTPUT:       BBRenderFarm-${{ github.ref_name }}-linux-x86_64.AppImage
+          QMAKE:        ${{ env.Qt6_DIR }}/../../../bin/qmake6
+          LD_LIBRARY_PATH: ${{ env.Qt6_DIR }}/../../
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/lib AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp build_linux/bin/BBRenderFarm   AppDir/usr/bin/
+          cp build_linux/bin/BBRenderServer AppDir/usr/bin/
+          cp build_linux/bin/BBRenderWorker AppDir/usr/bin/
+          # Desktop entry
+          cat > AppDir/usr/share/applications/bbrenderfarm.desktop << 'EOF'
+          [Desktop Entry]
+          Name=BB Render Farm
+          Exec=BBRenderFarm
+          Icon=bbrenderfarm
+          Type=Application
+          Categories=Graphics;
+          EOF
+          # Placeholder icon (white square — replace with real icon)
+          convert -size 256x256 xc:#1a1d24 AppDir/usr/share/icons/hicolor/256x256/apps/bbrenderfarm.png 2>/dev/null || \
+            cp /usr/share/pixmaps/xterm-color_48x48.xpm AppDir/usr/share/icons/hicolor/256x256/apps/bbrenderfarm.png 2>/dev/null || true
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --plugin qt \
+            --output appimage
+
+      - name: Rename AppImage
+        run: |
+          ver="${{ github.ref_name }}"
+          mv BBRenderFarm-*.AppImage "BBRenderFarm-${ver}-linux-x86_64.AppImage" 2>/dev/null || true
+          ls *.AppImage
+
+      - name: Create tarball (portable)
+        run: |
+          ver="${{ github.ref_name }}"
+          mkdir -p bbrender-${ver}-linux
+          cp build_linux/bin/BBRenderFarm   bbrender-${ver}-linux/
+          cp build_linux/bin/BBRenderServer bbrender-${ver}-linux/
+          cp build_linux/bin/BBRenderWorker bbrender-${ver}-linux/
+          cp README.md bbrender-${ver}-linux/
+          cat > bbrender-${ver}-linux/start_server.sh << 'SCRIPT'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          "$DIR/BBRenderServer" "$@"
+          SCRIPT
+          cat > bbrender-${ver}-linux/start_worker.sh << 'SCRIPT'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          "$DIR/BBRenderWorker" "$@"
+          SCRIPT
+          chmod +x bbrender-${ver}-linux/*.sh
+          tar -czf "BBRenderFarm-${ver}-linux-x86_64.tar.gz" bbrender-${ver}-linux/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            BBRenderFarm-*-linux-x86_64.AppImage
+            BBRenderFarm-*-linux-x86_64.tar.gz
+
+# ═══════════════════════════════════════════════════════════════
+#  macOS  (Clang + Qt6 + DMG)
+# ═══════════════════════════════════════════════════════════════
+  build-macos:
+    name: 🍎 macOS (Apple Silicon + Intel Universal)
+    runs-on: macos-14       # Apple Silicon (M1/M2)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version:  ${{ env.QT_VERSION }}
+          host:     mac
+          target:   desktop
+          arch:     clang_64
+          modules:  qtcharts
+          cache:    true
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Configure
+        run: |
+          cmake -B build_mac -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBBRENDER_BUILD_FRONTEND=ON \
+            -DBBRENDER_BUILD_BACKEND=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+
+      - name: Build
+        run: cmake --build build_mac --parallel $(sysctl -n hw.ncpu)
+
+      - name: Deploy Qt (macdeployqt)
+        run: |
+          QT_BIN="${Qt6_DIR}/../../../bin"
+          # Bundle the GUI app
+          "$QT_BIN/macdeployqt" build_mac/bin/BBRenderFarm.app \
+            -hardened-runtime \
+            -timestamp \
+            -sign-for-notarization="-" 2>/dev/null || \
+          "$QT_BIN/macdeployqt" build_mac/bin/BBRenderFarm.app
+
+      - name: Build DMG
+        run: |
+          ver="${{ github.ref_name }}"
+          DMG_NAME="BBRenderFarm-${ver}-macos-universal.dmg"
+          mkdir -p dmg_staging
+          cp -R build_mac/bin/BBRenderFarm.app dmg_staging/
+          cp    build_mac/bin/BBRenderServer   dmg_staging/
+          cp    build_mac/bin/BBRenderWorker   dmg_staging/
+          cp    README.md                      dmg_staging/
+
+          create-dmg \
+            --volname "BB Render Farm ${ver}" \
+            --volicon dmg_staging/BBRenderFarm.app/Contents/Resources/AppIcon.icns \
+            --window-pos  200 200 \
+            --window-size 660 400 \
+            --icon-size   128 \
+            --icon "BBRenderFarm.app" 165 185 \
+            --hide-extension "BBRenderFarm.app" \
+            --app-drop-link 495 185 \
+            "$DMG_NAME" \
+            "dmg_staging/" 2>/dev/null || \
+          hdiutil create -volname "BB Render Farm ${ver}" \
+            -srcfolder dmg_staging \
+            -ov -format UDZO "$DMG_NAME"
+
+      - name: Create tarball
+        run: |
+          ver="${{ github.ref_name }}"
+          mkdir bbrender-macos
+          cp -R build_mac/bin/BBRenderFarm.app bbrender-macos/
+          cp    build_mac/bin/BBRenderServer   bbrender-macos/
+          cp    build_mac/bin/BBRenderWorker   bbrender-macos/
+          cp    README.md                      bbrender-macos/
+          tar -czf "BBRenderFarm-${ver}-macos-universal.tar.gz" bbrender-macos/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            BBRenderFarm-*-macos-universal.dmg
+            BBRenderFarm-*-macos-universal.tar.gz
+
+# ═══════════════════════════════════════════════════════════════
+#  PUBLISH GITHUB RELEASE
+# ═══════════════════════════════════════════════════════════════
+  publish-release:
+    name: 📦 Publish GitHub Release
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh release-files/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "BB Render Farm ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## ⬛ BB Render Farm ${{ github.ref_name }}
+
+            High-performance distributed render farm manager.
+            Supports: **Nuke · Silhouette · Blender · Houdini · Maya · Cinema4D**
+
+            ---
+
+            ### 📥 Downloads
+
+            | Platform | Package | Type |
+            |----------|---------|------|
+            | 🪟 Windows | `BBRenderFarm-*-windows-x64-setup.exe` | Installer |
+            | 🪟 Windows | `BBRenderFarm-*-windows-x64-portable.zip` | Portable ZIP |
+            | 🐧 Linux | `BBRenderFarm-*-linux-x86_64.AppImage` | AppImage (self-contained) |
+            | 🐧 Linux | `BBRenderFarm-*-linux-x86_64.tar.gz` | Tarball |
+            | 🍎 macOS | `BBRenderFarm-*-macos-universal.dmg` | Disk Image |
+            | 🍎 macOS | `BBRenderFarm-*-macos-universal.tar.gz` | Tarball |
+
+            ### 🚀 Quick Start
+            ```bash
+            # 1. Start server on your farm machine
+            BBRenderServer --port 9876
+
+            # 2. Start worker on each render node
+            BBRenderWorker --server <FARM_IP> --port 9876
+
+            # 3. Open GUI and click ▶ Start Server
+            BBRenderFarm
+            ```
+
+            ### 📋 Included Binaries
+            - `BBRenderFarm`   — Qt6 desktop GUI
+            - `BBRenderServer` — Headless farm server daemon
+            - `BBRenderWorker` — Render node worker agent
+
+          files: release-files/*
